@@ -1,20 +1,51 @@
-import os
-import requests
-from bs4 import BeautifulSoup
-import base64
-import re
-import urllib.parse
+import datetime as dt
 import json
+import os
+import re
+import threading
 import time
-from datetime import datetime, timedelta
-import pytz
-from playwright.sync_api import sync_playwright
-from flask import Flask, jsonify, Response
-from apscheduler.schedulers.background import BackgroundScheduler
+import base64
+import urllib.parse
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urljoin
 
-app = Flask(__name__)
-OUTPUT_FILE = 'output/extracted_data.json'
-LAST_RUN_TIME = "尚未执行"
+import requests
+from flask import Flask, Response, jsonify
+from playwright.sync_api import sync_playwright
+
+
+@dataclass
+class Config:
+    source_url: str
+    play_link_host_filter: str
+    play_host_prefix: str
+    keywords_regex: str
+    schedule_minutes: int
+    tz_name: str
+    output_file: Path
+    ids_file: Path
+    timeout_seconds: int
+    host: str
+    port: int
+    target_key: bytes = b"ABCDEFGHIJKLMNOPQRSTUVWX"
+
+
+def load_config() -> Config:
+    return Config(
+        source_url=os.getenv("SOURCE_URL", "https://im-imgs-bucket.oss-accelerate.aliyuncs.com/index.js?t_5").strip(),
+        play_link_host_filter=os.getenv("PLAY_LINK_HOST_FILTER", "play.sportsteam368.com").strip(),
+        play_host_prefix=os.getenv("PLAY_HOST_PREFIX", "http://play.sportsteam368.com").strip(),
+        keywords_regex=os.getenv("KEYWORDS_REGEX", r"高清直播|蓝光"),
+        schedule_minutes=int(os.getenv("SCHEDULE_MINUTES", "30")),
+        tz_name=os.getenv("TZ_NAME", "Asia/Shanghai"),
+        output_file=Path(os.getenv("OUTPUT_FILE", "output/tokens.txt")),
+        ids_file=Path(os.getenv("IDS_FILE", "output/ids.json")),
+        timeout_seconds=int(os.getenv("HTTP_TIMEOUT_SECONDS", "20")),
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "5000")),
+    )
+
 
 # ==========================================
 # 核心：XXTEA 解密算法
@@ -75,165 +106,163 @@ def xxtea_decrypt(data, key):
         
     return long2str(v, True)
 
+
 # ==========================================
-# 爬虫任务逻辑
+# 辅助函数
 # ==========================================
-def scrape_job():
-    global LAST_RUN_TIME
-    tz = pytz.timezone('Asia/Shanghai')
-    now = datetime.now(tz)
-    LAST_RUN_TIME = now.strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{LAST_RUN_TIME}] 开始执行抓取任务...")
-    
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    
-    # 1. 抓取包含赛程的 JS 文件
+def now_in_tz(tz_name: str) -> dt.datetime:
     try:
-        js_url = f"https://im-imgs-bucket.oss-accelerate.aliyuncs.com/index.js?t={int(time.time())}"
-        res = requests.get(js_url, headers=headers, timeout=10)
-        res.encoding = 'utf-8'
-        
-        html_parts = []
-        for m in re.finditer(r"document\.write\((['\"])(.*?)\1\);", res.text):
-            html_parts.append(m.group(2))
-        full_html = "".join(html_parts)
-        soup = BeautifulSoup(full_html, 'html.parser')
-    except Exception as e:
-        print(f"获取JS赛程失败: {e}")
-        return
+        from zoneinfo import ZoneInfo
+        return dt.datetime.now(ZoneInfo(tz_name))
+    except Exception:
+        return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).astimezone(
+            dt.timezone(dt.timedelta(hours=8))
+        )
 
-    matches_to_process = []
-    
-    # 定义时间窗口：当前时间 ±3 小时
-    lower_bound = now - timedelta(hours=3)
-    upper_bound = now + timedelta(hours=3)
 
-    # 2. 解析每场比赛
-    for ul in soup.find_all('ul', class_='play'):
-        league_elem = ul.find('li', class_='lab_events')
-        time_elem = ul.find('li', class_='lab_time')
-        home_elem = ul.find('li', class_='lab_team_home')
-        away_elem = ul.find('li', class_='lab_team_away')
+def fetch_text(url: str, timeout_seconds: int) -> str:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
+    resp = requests.get(url, headers=headers, timeout=timeout_seconds)
+    resp.raise_for_status()
+    resp.encoding = resp.apparent_encoding or resp.encoding
+    return resp.text
 
-        if not (league_elem and time_elem and home_elem and away_elem):
-            continue
 
-        league = league_elem.text.strip()
-        time_str = time_elem.text.strip()
-        home = home_elem.find('strong').text.strip() if home_elem.find('strong') else ""
-        away = away_elem.find('strong').text.strip() if away_elem.find('strong') else ""
+def extract_document_write_lines(js_text: str) -> list[str]:
+    return re.findall(r"document\.write\('([^']*)'\);", js_text)
 
+
+def parse_mmdd_hhmm_to_datetime(value: str, now_bj: dt.datetime) -> dt.datetime | None:
+    m = re.match(r"^(\d{2})-(\d{2})\s+(\d{2}):(\d{2})$", value)
+    if not m:
+        return None
+    month, day, hour, minute = map(int, m.groups())
+
+    candidates = []
+    for y in (now_bj.year - 1, now_bj.year, now_bj.year + 1):
         try:
-            match_time = datetime.strptime(f"{now.year}-{time_str}", "%Y-%m-%d %H:%M")
-            match_time = tz.localize(match_time)
-            
-            if match_time > now + timedelta(days=300):
-                match_time = match_time.replace(year=now.year - 1)
-            elif match_time < now - timedelta(days=300):
-                match_time = match_time.replace(year=now.year + 1)
-                
-            if not (lower_bound <= match_time <= upper_bound):
-                continue
-        except Exception:
+            candidates.append(
+                now_bj.replace(
+                    year=y, month=month, day=day, hour=hour, minute=minute,
+                    second=0, microsecond=0,
+                )
+            )
+        except ValueError:
+            pass
+
+    if not candidates:
+        return None
+    return min(candidates, key=lambda d: abs((d - now_bj).total_seconds()))
+
+
+def within_3h(event_time: dt.datetime, now_bj: dt.datetime) -> bool:
+    return abs((event_time - now_bj).total_seconds()) <= 3 * 3600
+
+
+def extract_match_items(js_text: str, league_prefix: str = "JRS") -> list[dict]:
+    lines = extract_document_write_lines(js_text)
+    items: list[dict] = []
+    current: dict | None = None
+
+    league_re = re.compile(r'class="lab_events"[^>]*><span class="name">([^<]+)</span>')
+    time_re = re.compile(r'class="lab_time">([^<]+)<')
+    home_re = re.compile(r'class="lab_team_home"><strong class="name">([^<]+)</strong>')
+    away_re = re.compile(r'class="lab_team_away"><strong class="name">([^<]+)</strong>')
+    href_re = re.compile(r'href="([^"]+)"')
+
+    for line in lines:
+        if line.startswith('<ul class="item play'):
+            current = {"league": "", "time": "", "home": "", "away": "", "hrefs": []}
             continue
 
-        target_link = None
-        for a in ul.find_all('a', href=True):
-            if 'play.sportsteam368.com' in a['href']:
-                target_link = a['href']
-                break
-        
-        if target_link:
-            match_name = f"JRS {league} {home} VS {away} {time_str}"
-            matches_to_process.append({
-                'name': match_name,
-                'url': target_link
-            })
-
-    # 3. 获取 高清/蓝光 的 data-play 链接，并保存父页面 URL 用于防盗链
-    final_play_urls = []
-    for m in matches_to_process:
-        try:
-            res = requests.get(m['url'], headers=headers, timeout=10)
-            soup = BeautifulSoup(res.text, 'html.parser')
-            for a in soup.find_all('a', attrs={'data-play': True}):
-                text_content = a.text
-                if '高清' in text_content or '蓝光' in text_content:
-                    play_url = "http://play.sportsteam368.com" + a['data-play']
-                    final_play_urls.append({
-                        'name': m['name'],
-                        'url': play_url,
-                        'parent_url': m['url']  # 记录父页面
-                    })
-                    break
-        except Exception:
+        if current is None:
             continue
 
-    # 4. 模拟浏览器访问，提取 ID/encodedStr（使用 Referer 防盗链破解法）
-    final_data = []
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        
-        for item in final_play_urls:
-            page = context.new_page()
-            requests_list = []
-            page.on("request", lambda request: requests_list.append(request.url))
-            
-            try:
-                # 设置防盗链 Referer 骗过服务器验证
-                page.set_extra_http_headers({"Referer": item['parent_url']})
-                page.goto(item['url'], wait_until='domcontentloaded', timeout=15000)
-                page.wait_for_timeout(2000)
-                
-                content = page.content()
-                extracted_id = None
-                
-                # 策略1：直接正则提取源码
-                match = re.search(r"var\s+encodedStr\s*=\s*['\"]([^'\"]+)['\"]", content)
-                if match:
-                    extracted_id = match.group(1)
-                
-                # 策略2：资源树拦截兜底
-                if not extracted_id:
-                    for req_url in requests_list:
-                        if 'paps.html?id=' in req_url:
-                            extracted_id = req_url.split('paps.html?id=')[-1].split('&')[0]
-                            break
-                            
-                if extracted_id:
-                    final_data.append({
-                        'name': item['name'],
-                        'id': extracted_id
-                    })
-                    print(f"✅ 成功抓取: {item['name']}")
-                else:
-                    print(f"❌ 未能抓取: {item['name']}")
-                    
-            except Exception as e:
-                print(f"⚠️ 页面访问超时或出错: {e}")
-            finally:
-                page.close()
-        browser.close()
+        m = league_re.search(line)
+        if m:
+            current["league"] = f"{league_prefix} {m.group(1).strip()}"
 
-    # 5. 保存结果
-    os.makedirs('output', exist_ok=True)
-    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-        json.dump(final_data, f, ensure_ascii=False, indent=2)
-    print(f"任务完成，共保存 {len(final_data)} 场比赛数据。")
+        m = time_re.search(line)
+        if m:
+            current["time"] = m.group(1).strip()
+
+        m = home_re.search(line)
+        if m:
+            current["home"] = m.group(1).strip()
+
+        m = away_re.search(line)
+        if m:
+            current["away"] = m.group(1).strip()
+
+        for hm in href_re.findall(line):
+            if hm.startswith("http://") or hm.startswith("https://"):
+                current["hrefs"].append(hm.strip())
+
+        if line == "</ul>":
+            if current["league"] and current["time"] and current["home"] and current["away"]:
+                current["hrefs"] = sorted(set(current["hrefs"]))
+                items.append(current)
+            current = None
+
+    return items
+
+
+def extract_data_play_urls(page_text: str, cfg: Config) -> list[str]:
+    pattern = re.compile(
+        rf'<a[^>]*data-play="([^"]+)"[^>]*>\s*<em[^>]*></em>\s*<strong>([^<]*({cfg.keywords_regex})[^<]*)</strong>',
+        re.IGNORECASE,
+    )
+    urls = []
+    for m in pattern.finditer(page_text):
+        data_play = m.group(1).strip()
+        full_url = urljoin(cfg.play_host_prefix.rstrip("/") + "/", data_play.lstrip("/"))
+        urls.append(full_url)
+    return sorted(set(urls))
+
 
 # ==========================================
-# 统一的播放列表生成逻辑 (支持 M3U 和 TXT)
+# 状态与存储
 # ==========================================
-def generate_playlist(fmt="m3u", mode="clean"):
-    if not os.path.exists(OUTPUT_FILE):
-        return "请稍后再试，爬虫尚未生成数据"
+class AppState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.last_run_at: str | None = None
+        self.last_error: str | None = None
+        self.last_count: int = 0
+
+STATE = AppState()
+
+
+def write_ids(path: Path, ids: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(ids, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def read_ids(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+    except Exception:
+        return []
+    return []
+
+
+# ==========================================
+# 播放列表生成逻辑 (集成 XXTEA)
+# ==========================================
+def generate_playlist(cfg: Config, fmt="m3u", mode="clean") -> str:
+    data_list = read_ids(cfg.ids_file)
+    if not data_list:
+        return "请稍后再试，爬虫尚未生成数据或暂无比赛"
         
-    with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
-        data_list = json.load(f)
-    
-    target_key = b"ABCDEFGHIJKLMNOPQRSTUVWX"
-    
     if fmt == "m3u":
         content = "#EXTM3U\n"
     else:
@@ -242,7 +271,7 @@ def generate_playlist(fmt="m3u", mode="clean"):
     for item in data_list:
         try:
             raw_id = item['id']
-            match_name = item['name']
+            match_name = f"{item['league']} {item['home']} VS {item['away']} {item['time']}"
             if not raw_id: continue
             
             decoded_id = urllib.parse.unquote(raw_id)
@@ -250,7 +279,7 @@ def generate_playlist(fmt="m3u", mode="clean"):
             if pad != 4: decoded_id += "=" * pad
                 
             bin_data = base64.b64decode(decoded_id)
-            decrypted_bytes = xxtea_decrypt(bin_data, target_key)
+            decrypted_bytes = xxtea_decrypt(bin_data, cfg.target_key)
             
             if decrypted_bytes:
                 json_str = decrypted_bytes.decode('utf-8', errors='ignore')
@@ -272,46 +301,195 @@ def generate_playlist(fmt="m3u", mode="clean"):
             
     return content
 
+
 # ==========================================
-# Web 接口
+# 核心抓取循环 (集成 Playwright)
 # ==========================================
-@app.route('/')
-def index():
-    return jsonify({
-        "status": "running",
-        "last_run_time": LAST_RUN_TIME,
-        "endpoints": ["/ids", "/ids.txt", "/m3u", "/m3u_plus", "/txt", "/txt_plus"]
-    })
+def run_once(cfg: Config) -> None:
+    now_bj = now_in_tz(cfg.tz_name)
+    js_text = fetch_text(cfg.source_url, cfg.timeout_seconds)
+    raw_items = extract_match_items(js_text, league_prefix="JRS")
 
-@app.route('/ids')
-@app.route('/ids.txt')
-def get_ids():
-    if not os.path.exists(OUTPUT_FILE):
-        return Response("数据尚未生成", mimetype='text/plain; charset=utf-8')
-    with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
-        data_list = json.load(f)
-    
-    lines = [f"{item['name']} ---- {item['id']}" for item in data_list]
-    return Response("\n".join(lines), mimetype='text/plain; charset=utf-8', headers={"Access-Control-Allow-Origin": "*"})
+    # 1. 过滤时间和拼接目标
+    match_links: list[tuple[str, dict]] = []
+    for item in raw_items:
+        evt = parse_mmdd_hhmm_to_datetime(item["time"], now_bj)
+        if not evt or not within_3h(evt, now_bj):
+            continue
+        meta = {
+            "league": item["league"],
+            "time": item["time"],
+            "home": item["home"],
+            "away": item["away"],
+        }
+        for href in item["hrefs"]:
+            if cfg.play_link_host_filter and cfg.play_link_host_filter not in href:
+                continue
+            match_links.append((href, meta))
 
-@app.route('/m3u')
-def get_m3u_clean():
-    return Response(generate_playlist("m3u", "clean"), mimetype='text/plain; charset=utf-8', headers={"Access-Control-Allow-Origin": "*"})
+    # 2. 收集 data-play 任务，并保留父页面 parent_url 防盗链
+    data_play_tasks: list[tuple[str, str, dict]] = []
+    seen_pair = set()
+    for href, meta in match_links:
+        try:
+            page_html = fetch_text(href, cfg.timeout_seconds)
+            for dp in extract_data_play_urls(page_html, cfg):
+                key = (dp, meta["league"], meta["time"], meta["home"], meta["away"])
+                if key not in seen_pair:
+                    seen_pair.add(key)
+                    # 传入 parent_url: href
+                    data_play_tasks.append((dp, href, meta))
+        except Exception as exc:
+            print(f"[warn] open candidate failed: {href} err={exc}")
 
-@app.route('/m3u_plus')
-def get_m3u_plus():
-    return Response(generate_playlist("m3u", "plus"), mimetype='text/plain; charset=utf-8', headers={"Access-Control-Allow-Origin": "*"})
+    # 3. 使用 Playwright 统一处理深度提取 (单次启动浏览器，提升性能)
+    mapped_ids: list[dict] = []
+    seen_mapped = set()
 
-@app.route('/txt')
-def get_txt_clean():
-    return Response(generate_playlist("txt", "clean"), mimetype='text/plain; charset=utf-8', headers={"Access-Control-Allow-Origin": "*"})
+    if data_play_tasks:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+            context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            
+            for dp_url, parent_url, meta in data_play_tasks:
+                page = context.new_page()
+                requests_list = []
+                page.on("request", lambda request: requests_list.append(request.url))
+                
+                extracted_id = None
+                try:
+                    # 强力防盗链破解
+                    page.set_extra_http_headers({"Referer": parent_url})
+                    page.goto(dp_url, wait_until='domcontentloaded', timeout=15000)
+                    page.wait_for_timeout(2000)
+                    
+                    content = page.content()
+                    
+                    # 策略1：正则提取
+                    match = re.search(r"var\s+encodedStr\s*=\s*['\"]([^'\"]+)['\"]", content)
+                    if match:
+                        extracted_id = match.group(1)
+                    
+                    # 策略2：资源树兜底
+                    if not extracted_id:
+                        for req_url in requests_list:
+                            if 'paps.html?id=' in req_url:
+                                extracted_id = req_url.split('paps.html?id=')[-1].split('&')[0]
+                                break
+                except Exception as exc:
+                    print(f"[warn] Playwright failed: {dp_url} err={exc}")
+                finally:
+                    page.close()
 
-@app.route('/txt_plus')
-def get_txt_plus():
-    return Response(generate_playlist("txt", "plus"), mimetype='text/plain; charset=utf-8', headers={"Access-Control-Allow-Origin": "*"})
+                if extracted_id:
+                    row = {
+                        "id": extracted_id,
+                        "league": meta["league"],
+                        "time": meta["time"],
+                        "home": meta["home"],
+                        "away": meta["away"],
+                    }
+                    sk = (row["id"], row["league"], row["time"], row["home"], row["away"])
+                    if sk not in seen_mapped:
+                        seen_mapped.add(sk)
+                        mapped_ids.append(row)
+                        print(f"✅ 成功抓取: {meta['home']} VS {meta['away']}")
+                else:
+                    print(f"❌ 抓取为空: {meta['home']} VS {meta['away']}")
+                    
+            browser.close()
+
+    # 4. 排序保存
+    mapped_ids.sort(key=lambda x: (x["time"], x["league"], x["home"], x["away"], x["id"]))
+    write_ids(cfg.ids_file, mapped_ids)
+
+    with STATE.lock:
+        STATE.last_run_at = now_bj.isoformat()
+        STATE.last_error = None
+        STATE.last_count = len(mapped_ids)
+
+    print(f"[info] mapped ids={len(mapped_ids)} -> {cfg.ids_file}")
+
+
+def scheduler_loop(cfg: Config) -> None:
+    # 启动时立刻执行一次
+    try:
+        run_once(cfg)
+    except Exception as exc:
+        print(f"[error] Initial run failed: {exc}")
+        
+    while True:
+        sleep_seconds = max(cfg.schedule_minutes, 1) * 60
+        print(f"[info] sleep {sleep_seconds}s")
+        time.sleep(sleep_seconds)
+        try:
+            run_once(cfg)
+        except Exception as exc:
+            with STATE.lock:
+                STATE.last_error = str(exc)
+            print(f"[error] {exc}")
+
+
+# ==========================================
+# Web 路由
+# ==========================================
+def create_app(cfg: Config) -> Flask:
+    app = Flask(__name__)
+
+    @app.get("/")
+    def index() -> Response:
+        with STATE.lock:
+            payload = {
+                "status": "running",
+                "last_run_at": STATE.last_run_at,
+                "last_error": STATE.last_error,
+                "mapped_id_count": STATE.last_count,
+                "ids_file": str(cfg.ids_file),
+                "endpoints": ["/", "/ids", "/ids.txt", "/m3u", "/m3u_plus", "/txt", "/txt_plus", "/run-once"],
+            }
+        return jsonify(payload)
+
+    @app.get("/ids")
+    def ids_json() -> Response:
+        data = read_ids(cfg.ids_file)
+        return jsonify({"count": len(data), "items": data})
+
+    @app.get("/ids.txt")
+    def ids_text() -> Response:
+        data = read_ids(cfg.ids_file)
+        lines = [f'{i["league"]}|{i["time"]}|{i["home"]} vs {i["away"]}|{i["id"]}' for i in data]
+        return Response("\n".join(lines) + ("\n" if lines else ""), mimetype="text/plain; charset=utf-8")
+
+    @app.get("/m3u")
+    def get_m3u_clean() -> Response:
+        return Response(generate_playlist(cfg, "m3u", "clean"), mimetype='text/plain; charset=utf-8')
+
+    @app.get("/m3u_plus")
+    def get_m3u_plus() -> Response:
+        return Response(generate_playlist(cfg, "m3u", "plus"), mimetype='text/plain; charset=utf-8')
+
+    @app.get("/txt")
+    def get_txt_clean() -> Response:
+        return Response(generate_playlist(cfg, "txt", "clean"), mimetype='text/plain; charset=utf-8')
+
+    @app.get("/txt_plus")
+    def get_txt_plus() -> Response:
+        return Response(generate_playlist(cfg, "txt", "plus"), mimetype='text/plain; charset=utf-8')
+
+    @app.post("/run-once")
+    def trigger_once() -> Response:
+        threading.Thread(target=run_once, args=(cfg,), daemon=True).start()
+        return jsonify({"queued": True})
+
+    return app
+
+
+def main() -> None:
+    cfg = load_config()
+    thread = threading.Thread(target=scheduler_loop, args=(cfg,), daemon=True)
+    thread.start()
+    app = create_app(cfg)
+    app.run(host=cfg.host, port=cfg.port, use_reloader=False)
 
 if __name__ == "__main__":
-    scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
-    scheduler.add_job(scrape_job, 'interval', minutes=30, next_run_time=datetime.now(pytz.timezone('Asia/Shanghai')))
-    scheduler.start()
-    app.run(host='0.0.0.0', port=5000, use_reloader=False)
+    main()

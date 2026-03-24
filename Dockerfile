@@ -1,26 +1,20 @@
-FROM python:3.10-slim
+# 使用与 requirements.txt 中 playwright 版本严格对应的官方镜像
+FROM mcr.microsoft.com/playwright/python:v1.42.0-jammy
 
-# 核心修复：强制 apt-get 采用非交互模式，遇到配置提示自动采用默认值，防止卡死
-ENV DEBIAN_FRONTEND=noninteractive
-
+# 设置工作目录
 WORKDIR /app
 
-# 1. 先安装 Python 依赖包
+# 拷贝依赖清单并安装 Python 依赖
+# (此时不需要再执行 playwright install，因为官方镜像已经自带了浏览器)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 2. 更新系统 -> 安装浏览器底层依赖 -> 安装 Chromium -> 清理缓存
-# 改用 python -m playwright 确保能准确调用到刚刚 pip 安装的模块
-RUN apt-get update && \
-    python -m playwright install-deps chromium && \
-    python -m playwright install chromium && \
-    rm -rf /var/lib/apt/lists/*
-
-# 3. 拷贝项目代码
+# 拷贝项目源码
 COPY . .
 
-# 暴露端口
+# 暴露 Flask 默认端口
 EXPOSE 5000
 
-# 运行程序
-CMD ["python", "main.py"]
+# 运行整合了 Flask 和定时任务的脚本
+# 加上 -u 参数强制 Python 不使用输出缓冲，这样在云平台的控制台能实时看到 print 的日志
+CMD ["python", "-u", "main.py"]

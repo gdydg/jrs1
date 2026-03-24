@@ -16,7 +16,9 @@ app = Flask(__name__)
 OUTPUT_FILE = 'output/extracted_data.json'
 LAST_RUN_TIME = "尚未执行"
 
-# ==========================================\n# 核心：XXTEA 解密算法\n# ==========================================
+# ==========================================
+# 核心：XXTEA 解密算法
+# ==========================================
 def str2long(s, w):
     v = []
     for i in range(0, len(s), 4):
@@ -73,7 +75,9 @@ def xxtea_decrypt(data, key):
         
     return long2str(v, True)
 
-# ==========================================\n# 爬虫任务逻辑\n# ==========================================
+# ==========================================
+# 爬虫任务逻辑
+# ==========================================
 def scrape_job():
     global LAST_RUN_TIME
     tz = pytz.timezone('Asia/Shanghai')
@@ -85,12 +89,10 @@ def scrape_job():
     
     # 1. 抓取包含赛程的 JS 文件
     try:
-        # 添加时间戳防缓存
         js_url = f"https://im-imgs-bucket.oss-accelerate.aliyuncs.com/index.js?t={int(time.time())}"
         res = requests.get(js_url, headers=headers, timeout=10)
         res.encoding = 'utf-8'
         
-        # 利用正则提取 document.write 中的 HTML
         html_parts = []
         for m in re.finditer(r"document\.write\((['\"])(.*?)\1\);", res.text):
             html_parts.append(m.group(2))
@@ -122,7 +124,6 @@ def scrape_job():
         away = away_elem.find('strong').text.strip() if away_elem.find('strong') else ""
 
         try:
-            # 补全时间为当年，处理跨年情况
             match_time = datetime.strptime(f"{now.year}-{time_str}", "%Y-%m-%d %H:%M")
             match_time = tz.localize(match_time)
             
@@ -131,13 +132,11 @@ def scrape_job():
             elif match_time < now - timedelta(days=300):
                 match_time = match_time.replace(year=now.year + 1)
                 
-            # 判断是否在 ±3 小时内
             if not (lower_bound <= match_time <= upper_bound):
                 continue
         except Exception:
             continue
 
-        # 查找指定的 sportsteam368 链接
         target_link = None
         for a in ul.find_all('a', href=True):
             if 'play.sportsteam368.com' in a['href']:
@@ -151,7 +150,7 @@ def scrape_job():
                 'url': target_link
             })
 
-    # 3. 访问子页面获取 高清/蓝光 的 data-play 链接
+    # 3. 获取 高清/蓝光 的 data-play 链接，并保存父页面 URL 用于防盗链
     final_play_urls = []
     for m in matches_to_process:
         try:
@@ -159,18 +158,18 @@ def scrape_job():
             soup = BeautifulSoup(res.text, 'html.parser')
             for a in soup.find_all('a', attrs={'data-play': True}):
                 text_content = a.text
-                if '高清直播' in text_content or '蓝光' in text_content:
-                    # 拼接完整播放地址
+                if '高清' in text_content or '蓝光' in text_content:
                     play_url = "http://play.sportsteam368.com" + a['data-play']
                     final_play_urls.append({
                         'name': m['name'],
-                        'url': play_url
+                        'url': play_url,
+                        'parent_url': m['url']  # 记录父页面
                     })
-                    break # 找到一个高清通道即可
+                    break
         except Exception:
             continue
 
-    # 4. 模拟浏览器访问终极页面，提取 ID/encodedStr
+    # 4. 模拟浏览器访问，提取 ID/encodedStr（使用 Referer 防盗链破解法）
     final_data = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
@@ -182,20 +181,24 @@ def scrape_job():
             page.on("request", lambda request: requests_list.append(request.url))
             
             try:
-                page.goto(item['url'], wait_until='networkidle', timeout=15000)
-                content = page.content()
+                # 设置防盗链 Referer 骗过服务器验证
+                page.set_extra_http_headers({"Referer": item['parent_url']})
+                page.goto(item['url'], wait_until='domcontentloaded', timeout=15000)
+                page.wait_for_timeout(2000)
                 
-                # 策略1：优先正则提取页面中的 var encodedStr
-                match = re.search(r"var\s+encodedStr\s*=\s*['\"]([^'\"]+)['\"]", content)
+                content = page.content()
                 extracted_id = None
                 
+                # 策略1：直接正则提取源码
+                match = re.search(r"var\s+encodedStr\s*=\s*['\"]([^'\"]+)['\"]", content)
                 if match:
                     extracted_id = match.group(1)
-                else:
-                    # 策略2：利用网络请求资源树提取 paps.html?id=
+                
+                # 策略2：资源树拦截兜底
+                if not extracted_id:
                     for req_url in requests_list:
                         if 'paps.html?id=' in req_url:
-                            extracted_id = req_url.split('paps.html?id=')[-1]
+                            extracted_id = req_url.split('paps.html?id=')[-1].split('&')[0]
                             break
                             
                 if extracted_id:
@@ -203,8 +206,12 @@ def scrape_job():
                         'name': item['name'],
                         'id': extracted_id
                     })
-            except Exception:
-                pass
+                    print(f"✅ 成功抓取: {item['name']}")
+                else:
+                    print(f"❌ 未能抓取: {item['name']}")
+                    
+            except Exception as e:
+                print(f"⚠️ 页面访问超时或出错: {e}")
             finally:
                 page.close()
         browser.close()
@@ -215,7 +222,9 @@ def scrape_job():
         json.dump(final_data, f, ensure_ascii=False, indent=2)
     print(f"任务完成，共保存 {len(final_data)} 场比赛数据。")
 
-# ==========================================\n# 统一的播放列表生成逻辑 (支持 M3U 和 TXT)\n# ==========================================
+# ==========================================
+# 统一的播放列表生成逻辑 (支持 M3U 和 TXT)
+# ==========================================
 def generate_playlist(fmt="m3u", mode="clean"):
     if not os.path.exists(OUTPUT_FILE):
         return "请稍后再试，爬虫尚未生成数据"
@@ -263,7 +272,9 @@ def generate_playlist(fmt="m3u", mode="clean"):
             
     return content
 
-# ==========================================\n# Web 接口\n# ==========================================
+# ==========================================
+# Web 接口
+# ==========================================
 @app.route('/')
 def index():
     return jsonify({
@@ -272,7 +283,6 @@ def index():
         "endpoints": ["/ids", "/ids.txt", "/m3u", "/m3u_plus", "/txt", "/txt_plus"]
     })
 
-# /ids 和 /ids.txt 路由，按照要求展示对应比赛与ID
 @app.route('/ids')
 @app.route('/ids.txt')
 def get_ids():
@@ -302,7 +312,6 @@ def get_txt_plus():
 
 if __name__ == "__main__":
     scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
-    # 启动时立即执行一次，以后每 30 分钟执行一次
     scheduler.add_job(scrape_job, 'interval', minutes=30, next_run_time=datetime.now(pytz.timezone('Asia/Shanghai')))
     scheduler.start()
     app.run(host='0.0.0.0', port=5000, use_reloader=False)

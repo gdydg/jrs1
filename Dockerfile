@@ -2,29 +2,17 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# 安装必要的系统库以支持 Playwright
-RUN apt-get update && apt-get install -y \
-    libnss3 \
-    libnspr4 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libdrm2 \
-    libxkbcommon0 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxfixes3 \
-    libxrandr2 \
-    libgbm1 \
-    libasound2 \
-    && rm -rf /var/lib/apt/lists/*
-
+# 1. 先拷贝依赖文件并安装 Python 库
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 安装 Chromium 浏览器供 Playwright 抓取渲染使用
-RUN playwright install chromium --with-deps
+# 2. 集中处理 Playwright 及其系统依赖，并在安装后立即清理缓存以极致压缩体积
+RUN apt-get update && \
+    playwright install-deps chromium && \
+    playwright install chromium && \
+    rm -rf /var/lib/apt/lists/*
 
+# 3. 拷贝项目代码
 COPY . .
 
 # 暴露端口
